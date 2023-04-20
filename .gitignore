@@ -4,3 +4,11 @@
 */*.o
 */*.out
 */*.log
+*/*/*.o
+*/*/*.out
+*/*/*.log
+.idea
+*/.idea
+*.csv
+*/*.csv
+.vscode
