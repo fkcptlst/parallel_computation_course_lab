@@ -35,6 +35,8 @@
 #define PARTITION_BEGIN_INDEX (SIDE_BUFFER_WIDTH)  // inclusive
 #define PARTITION_END_INDEX (SIDE_BUFFER_WIDTH + BLOCK_SIZE - 1)  // inclusive
 
+#define PARTITION_SIZE (sizeof (double) * MAT_DIM * BLOCK_SIZE)  // size of partition
+
 #define SIDE_BUFFER_SIZE (sizeof (double) * MAT_DIM * SIDE_BUFFER_WIDTH)  // size of side buffer
 
 
@@ -85,7 +87,7 @@ ProcData init_proc_data(int id) {
 /*
  * Description: get data from the matrix or the buffer, buffer_cols is j max
  */
-double read_buffer(const double *buffer, int buffer_cols, int i, int j) {
+double read_buffer(double *buffer, int buffer_cols, int i, int j) {
     return buffer[i * buffer_cols + j];
 }
 
@@ -125,6 +127,9 @@ bool set_data(const ProcData &proc_data, int i, int j, double value) {
     return false;
 }
 
+/*
+ * Description: swap the RO and WO buffer
+ * */
 void swap_buffer(ProcData &proc_data) {
     double *tmp = proc_data.RO_buffer_ptr;
     proc_data.RO_buffer_ptr = proc_data.WO_buffer_ptr;
@@ -134,6 +139,26 @@ void swap_buffer(ProcData &proc_data) {
 double *get_buffer_begin_ptr(double *buffer, int i, int j) {
     return buffer + i * MAT_DIM + j;
 }
+
+/*
+ * MPI_Sendrecv:
+ * Documentation: https://learn.microsoft.com/en-us/message-passing-interface/mpi-sendrecv-function
+ * Parameters:
+ * int MPIAPI MPI_Sendrecv(
+      _In_  void         *sendbuf,   // initial address of send buffer
+            int          sendcount,  // number of elements in send buffer
+            MPI_Datatype sendtype,
+            int          dest,       // rank of destination
+            int          sendtag,
+      _Out_ void         *recvbuf,   // initial address of receive buffer
+            int          recvcount,  // number of elements in receive buffer
+            MPI_Datatype recvtype,   // type of elements in receive buffer
+            int          source,     // rank of source
+            int          recvtag,    // message tag
+            MPI_Comm     comm,
+      _Out_ MPI_Status   *status
+    );
+ */
 
 /*
  * Description: Sync buffer using MPI_Sendrecv, i.e. Jacobian method
@@ -167,6 +192,32 @@ void sync_buffer(ProcData &proc_data) {
     swap_buffer(proc_data);
 }
 
+/*
+ * Called by Slave
+ */
+void submit_result(ProcData &proc_data)
+{
+    const double *buf_begin = get_buffer_begin_ptr(proc_data.RO_buffer_ptr, PARTITION_BEGIN_INDEX, 0);
+    MPI_Send(buf_begin, PARTITION_SIZE, MPI_UNSIGNED_CHAR, MASTER_ID, 0, MPI_COMM_WORLD);
+}
+
+/*
+ * Called by Master
+ * Input: result buffer, a 2-D array in 1-D format
+ * */
+void gather_result(double *result)
+{
+    // receive from MPI workers
+    for (int i = 0; i < SLAVE_NUM; i++)
+    {
+        DEBUG(TraceableInfo("Gathering result from slave %d\n", i););
+        // get MPI_Status
+        MPI_Status status;
+        MPI_Recv(get_buffer_begin_ptr(result,i * BLOCK_SIZE,0), PARTITION_SIZE, MPI_UNSIGNED_CHAR, i, 0, MPI_COMM_WORLD, &status);
+//        DEBUG(TraceableInfo("Status: %d\n", status.MPI_ERROR);)
+    }
+}
+
 
 void print_buffer(const ProcData &proc_data) {
     printf("%d========================================================\n", proc_data.id);
@@ -189,25 +240,7 @@ void print_buffer(const ProcData &proc_data) {
 // ****************************** ProcData Methods End  *********************************************
 
 
-/*
- * MPI_Sendrecv:
- * Documentation: https://learn.microsoft.com/en-us/message-passing-interface/mpi-sendrecv-function
- * Parameters:
- * int MPIAPI MPI_Sendrecv(
-      _In_  void         *sendbuf,   // initial address of send buffer
-            int          sendcount,  // number of elements in send buffer
-            MPI_Datatype sendtype,
-            int          dest,       // rank of destination
-            int          sendtag,
-      _Out_ void         *recvbuf,   // initial address of receive buffer
-            int          recvcount,  // number of elements in receive buffer
-            MPI_Datatype recvtype,   // type of elements in receive buffer
-            int          source,     // rank of source
-            int          recvtag,    // message tag
-            MPI_Comm     comm,
-      _Out_ MPI_Status   *status
-    );
- */
+
 
 // Test MPI_Sendrecv
 int main(int argc, char *argv[])
@@ -251,11 +284,16 @@ int main(int argc, char *argv[])
     MPI_Init(&argc, &argv);
 
     int my_id;
-    MPI_Comm_rank(MPI_COMM_WORLD, &my_id);
-    MPI_Comm_size(MPI_COMM_WORLD, &PROC_NUM);
 
-    if (my_id == MASTER_ID) {
+    MPI_Comm_size(MPI_COMM_WORLD, &PROC_NUM);
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_id);
+
+    double * result = NULL;
+    if (my_id == MASTER_ID)
+    {
         DEBUG(Info("Master process started\n");)
+        result = new double[MAT_DIM * MAT_DIM];
+
     }
 
     DEBUG(Info("my_id: %d, proc_num: %d\n", my_id, PROC_NUM);)
@@ -272,36 +310,77 @@ int main(int argc, char *argv[])
         {
             for (int j = 0; j < MAT_DIM; j++)
             {
-                if (my_id == 0 && i < 0)  // skip the first worker's upper buffer
+                // skip side buffer
+                if (i < 0 || i >= BLOCK_SIZE)
+                {
                     continue;
-                if (my_id == SLAVE_NUM - 1 && i > BLOCK_SIZE - 1)  // skip the last worker's lower buffer
-                    continue;
-                DEBUG(Info("%d-(%d)-(%d): %lf\n", my_id, i, j, matrix[i_offset + i][j]);)
+                }
                 Assert(set_data(proc_data, i, j, matrix[i_offset + i][j]) == true, "set_data failed, (%d,%d)=%lf\n", i, j, matrix[i_offset + i][j]);
             }
         }
 
-        DEBUG(swap_buffer(proc_data);)
-        DEBUG(Info("my_id: %d, buffer initialized\n", my_id);)
-        DEBUG(sleep(my_id);)  // so that the output is in order
-        print_buffer(proc_data);
+        // convolution
+        for (int n = 0; n < NUM_ITER; n++)
+        {
+            // sync first
+            sync_buffer(proc_data);
+            // calculation
+            for (int i = 0; i < BLOCK_SIZE; i++)
+            {
+                for (int j = 0; j < MAT_DIM; j++)
+                {
+                    double sum = 0;
+                    for (int _i = - SIDE_BUFFER_WIDTH; _i <= SIDE_BUFFER_WIDTH; _i++)
+                    {
+                        for (int _j = - SIDE_BUFFER_WIDTH; _j <= SIDE_BUFFER_WIDTH; _j++)
+                        {
+                            sum += get_data(proc_data, i + _i, j + _j) * kernel[_i + SIDE_BUFFER_WIDTH][_j + SIDE_BUFFER_WIDTH];
+                        }
+                    }
+                    set_data(proc_data, i, j, sum);
+                }
+            }
+        }
 
-        set_data(proc_data, 0, 0, my_id+1);
-        set_data(proc_data, BLOCK_SIZE - 1, MAT_DIM - 1, my_id+10);
-        sync_buffer(proc_data);
-        DEBUG(sleep(my_id);)  // so that the output is in order
-        Info("my_id: %d, buffer synced\n", my_id);
-        print_buffer(proc_data);
+//        DEBUG(Info("my_id: %d, buffer initialized\n", my_id);)
+//        DEBUG(sleep(my_id);)  // so that the output is in order
+//        print_buffer(proc_data);
+
+//        set_data(proc_data, 0, 0, my_id+1);
+//        set_data(proc_data, BLOCK_SIZE - 1, MAT_DIM - 1, my_id+100);
+//        sync_buffer(proc_data);
+//        DEBUG(sleep(my_id);)  // so that the output is in order
+//        Info("my_id: %d, buffer synced\n", my_id);
+//        print_buffer(proc_data);
+
+        swap_buffer(proc_data);  // swap the buffer, so that the result is in the RO_buffer_ptr
+        // submit
+//        DEBUG(set_data(proc_data, 0, 0, my_id+10);)
+//        DEBUG(sleep(1 - my_id);)  // so that the output is in order
+//        DEBUG(print_buffer(proc_data);)
+        DEBUG(Info("slave %d submitting\n", my_id);)
+        submit_result(proc_data);
+
     } // end worker process
 
     // TODO: master process gather results
     if (my_id == MASTER_ID)
     {
         sleep(5);  // wait for all workers to finish
+        gather_result(result);
+        // print result
+        for (int i = 0; i < MAT_DIM; i++)
+        {
+            for (int j = 0; j < MAT_DIM; j++)
+            {
+                printf("%lf\t", result[i * MAT_DIM + j]);
+            }
+            printf("\n");
+        }
         DEBUG(Info("Master process ended\n");)
     }
 
     MPI_Finalize();
-    DEBUG(Info("process ended\n");)
+    DEBUG(Info("process %d finalized\n", my_id);)
     return 0;
 }

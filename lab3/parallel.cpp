@@ -1,342 +1,356 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <pthread.h>
-#include <iostream>
-#include <fstream>
-#include <math.h>
-#include <vector>
 #include "mpi.h"
-#include "assert.h"
+#include <stdlib.h>
+#include <string.h>
+#include <fstream>
+#include <unistd.h>
 
-using namespace std;
+//#define DEBUG_ON
 
-const int MAX_SIZE = 1000;
-const int MAX_MAT_DIM = 1000;
-const int MAX_KERNEL_DIM = 9;
+#include "debug.h"
 
-int N; // number of iterations
-int mat_dim, kernel_dim;
-int T;              // number of threads
-int BLOCK_SIZE = 0; // block size
 
-int matrix[MAX_MAT_DIM][MAX_MAT_DIM];
-int kernel[MAX_KERNEL_DIM][MAX_KERNEL_DIM];
-int tmp[MAX_MAT_DIM][MAX_MAT_DIM]; // middle result
+#define SLAVE_NUM (PROC_NUM - 1)  // number of slaves
+#define MASTER_ID SLAVE_NUM
 
-typedef struct Thread_data
-{
-    int thread_id;
-    int partition_begin_index; // inclusive, marks the first row of the block, equals to kernel_dim - 1
-    int partition_end_index;   // inclusive, marks the last row of the block, equals to partition_begin_index + BLOCK_SIZE - 1
-    int partition_size;        // equals to partition_end_index - partition_begin_index + 1
-    int buffer_width;          // equals to (kernel_dim - 1) / 2
+/*
+ * Buffer Layout:
+ *  ▲   +--------------------------------------------------+
+ *  |   |                        ...                       |  <-- side_buffer_up            (SIDE_BUFFER_WIDTH)
+ *  |   +--------------------------------------------------+ -<-- partition_begin_index
+ * buf  |                      .......                     |                                 (BLOCK_SIZE)
+ *  |   +--------------------------------------------------+ -<-- partition_end_index
+ *  |   |                        ...                       |  <-- side_buffer_down          (SIDE_BUFFER_WIDTH)
+ *  ▼   +--------------------------------------------------+
+ */
 
-    vector<vector<double>> side_buffer_up;   // upper side buffer
-    vector<vector<double>> side_buffer_down; // lower side buffer
+#define BLOCK_SIZE (MAT_DIM / SLAVE_NUM)  // partition size
+#define SIDE_BUFFER_WIDTH ((KERNEL_DIM - 1) / 2)  // the width of side buffers, i.e. (total buffer width - partition width) / 2
 
-    Thread_data(int thread_id, int partition_begin_index, int partition_end_index) : thread_id(thread_id), partition_begin_index(partition_begin_index), partition_end_index(partition_end_index)
-    {
-        partition_size = partition_end_index - partition_begin_index + 1;
-        // the width of buffers is (kernel_dim - 1) / 2, the height is mat_dim + 2*((kernel_dim - 1) / 2)
-        buffer_width = (kernel_dim - 1) / 2;
-        side_buffer_up.resize(buffer_width);
-        side_buffer_down.resize(buffer_width);
-        for (int i = 0; i < buffer_width; i++)
-        {
-            // side_buffer_up[i].resize(mat_dim + 2 * buffer_width); // buffer_width is also the padding dimension
-            // side_buffer_down[i].resize(mat_dim + 2 * buffer_width);
-            side_buffer_up[i].resize(mat_dim); // buffer_width is also the padding dimension
-            side_buffer_down[i].resize(mat_dim);
-        }
+#define UPPER_BUFFER_BEGIN_INDEX 0  // inclusive
+#define UPPER_BUFFER_END_INDEX (SIDE_BUFFER_WIDTH - 1)  // inclusive
+
+#define LOWER_BUFFER_BEGIN_INDEX (SIDE_BUFFER_WIDTH + BLOCK_SIZE)  // inclusive
+#define LOWER_BUFFER_END_INDEX (2 * SIDE_BUFFER_WIDTH + BLOCK_SIZE - 1)  // inclusive
+
+#define PARTITION_BEGIN_INDEX (SIDE_BUFFER_WIDTH)  // inclusive
+#define PARTITION_END_INDEX (SIDE_BUFFER_WIDTH + BLOCK_SIZE - 1)  // inclusive
+
+#define PARTITION_SIZE (sizeof (double) * MAT_DIM * BLOCK_SIZE)  // size of partition
+
+#define SIDE_BUFFER_SIZE (sizeof (double) * MAT_DIM * SIDE_BUFFER_WIDTH)  // size of side buffer
+
+
+/*
+ * GLOBAL VARIABLES
+ */
+int NUM_ITER = 10;
+
+int MAT_DIM = 1000;
+int KERNEL_DIM = 3;
+
+int PROC_NUM = 4;
+
+
+// ****************************** ProcData Definition  *********************************************
+typedef struct ProcData {
+    int id;
+
+    // buffers are 2-D arrays in 1-D format
+    double *buffer[2]; // 2 buffers, one for reading, one for writing, switch alternately
+
+    double *RO_buffer_ptr; // rows(i)=buffer_width, cols(j)=MAT_DIM, Read Only, stores previous results
+    double *WO_buffer_ptr; // rows(i)=buffer_width, cols(j)=MAT_DIM, Write Only, stores temporary results
+} ProcData;
+
+// ****************************** ProcData Methods Begin  *********************************************
+
+/*
+ * Description: initialize ProcData, pseudo constructor
+ */
+ProcData init_proc_data(int id) {
+    ProcData proc_data;
+    proc_data.id = id;
+
+    // allocate memory for buffers
+    for (int i = 0; i < 2; i++) {
+        proc_data.buffer[i] = (double *) malloc(sizeof(double) * MAT_DIM * (2 * SIDE_BUFFER_WIDTH + BLOCK_SIZE));
+        memset(proc_data.buffer[i], 0, sizeof(double) * MAT_DIM * (2 * SIDE_BUFFER_WIDTH + BLOCK_SIZE));
     }
 
-    void print_buffer()
-    {
-        printf("printing upper buffer\n");
-        for(int i = 0; i < side_buffer_up.size(); i++)
-        {
-            for(int j = 0; j < side_buffer_up[i].size(); j++)
-            {
-                printf("%lf\t", side_buffer_up[i][j]);
-            }
-            printf("\n");
-        }
+    // assign initial buffer pointers
+    proc_data.RO_buffer_ptr = proc_data.buffer[0];
+    proc_data.WO_buffer_ptr = proc_data.buffer[1];
 
-        printf("printing lower buffer\n");
-        for(int i = 0; i < side_buffer_down.size(); i++)
-        {
-            for(int j = 0; j < side_buffer_down[i].size(); j++)
-            {
-                printf("%lf\t", side_buffer_down[i][j]);
-            }
-            printf("\n");
-        }
+    return proc_data;
+}
+
+/*
+ * Description: get data from the matrix or the buffer, buffer_cols is j max
+ */
+double read_buffer(double *buffer, int buffer_cols, int i, int j) {
+    return buffer[i * buffer_cols + j];
+}
+
+void write_buffer(double *buffer, int buffer_cols, int i, int j, double value) {
+    buffer[i * buffer_cols + j] = value;
+}
+
+/*
+ * Description: i, j are referring to the partitioned section, side buffer is excluded
+ *              i in range [- SIDE_BUFFER_WIDTH, BLOCK_SIZE + SIDE_BUFFER_WIDTH - 1]
+ *              j in range [0 - SIDE_BUFFER_WIDTH, MAT_DIM + SIDE_BUFFER_WIDTH - 1]
+ */
+double get_data(const ProcData &proc_data, int i, int j) {
+    if (j < 0 || j >= MAT_DIM) // padding
+    {
+        return 0;
     }
 
-    double get_data(int i, int j)
+    int _i = i + PARTITION_BEGIN_INDEX;
+    int _j = j;  // the column index remains the same
+    return read_buffer(proc_data.RO_buffer_ptr, MAT_DIM, _i, _j);
+}
+
+/*
+ * Description: i, j are referring to the partitioned section, side buffer is excluded
+ *              i in range [- SIDE_BUFFER_WIDTH, BLOCK_SIZE + SIDE_BUFFER_WIDTH - 1]
+ *              j in range [0 - SIDE_BUFFER_WIDTH, MAT_DIM + SIDE_BUFFER_WIDTH - 1]
+ */
+bool set_data(const ProcData &proc_data, int i, int j, double value) {
+    if (i >= -SIDE_BUFFER_WIDTH && i < BLOCK_SIZE + SIDE_BUFFER_WIDTH && j >= 0 &&
+        j < MAT_DIM) // in the partitioned section{
     {
-        if (j < 0 || j >= mat_dim) // padding
-        {
-            return 0;
-        }
-        else if (i < 0 || i >= partition_size) // use jacobian buffer
-        {
-            if (i < 0) // upper buffer
-            {
-                return side_buffer_up[buffer_width + i][j];
-            }
-            else // lower buffer
-            {
-                return side_buffer_down[i - partition_size][j];
-            }
-        }
-        else // within the block partition
-        {
-            return matrix[i + partition_begin_index][j];
-        }
+        int _i = i + PARTITION_BEGIN_INDEX;
+        int _j = j;  // the column index remains the same
+        write_buffer(proc_data.WO_buffer_ptr, MAT_DIM, _i, _j, value);
+        return true;
     }
+    return false;
+}
 
-    bool set_data(int i, int j, double value)
-    {
-        if (i >= 0 && i < partition_size && j >= 0 && j < mat_dim) // within the block partition
-        {
-            tmp[i + partition_begin_index][j] = value;
-            return true;
-        }
-        else
-        {
-            return false;
-        }
-    }
-} Thread_data;
+/*
+ * Description: swap the RO and WO buffer
+ * */
+void swap_buffer(ProcData &proc_data) {
+    double *tmp = proc_data.RO_buffer_ptr;
+    proc_data.RO_buffer_ptr = proc_data.WO_buffer_ptr;
+    proc_data.WO_buffer_ptr = tmp;
+}
 
-Thread_data *thread_data_array[MAX_SIZE]; // array pointer to Thread_data
+double *get_buffer_begin_ptr(double *buffer, int i, int j) {
+    return buffer + i * MAT_DIM + j;
+}
 
-void send_recv(Thread_data &thread_data)
-{
-    // barrier
-    static bool initialized = false;
-    static int arrived_threads = 0;
-    static pthread_mutex_t mutex_arrived_counter = PTHREAD_MUTEX_INITIALIZER;
-    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-    static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+/*
+ * MPI_Sendrecv:
+ * Documentation: https://learn.microsoft.com/en-us/message-passing-interface/mpi-sendrecv-function
+ * Parameters:
+ * int MPIAPI MPI_Sendrecv(
+      _In_  void         *sendbuf,   // initial address of send buffer
+            int          sendcount,  // number of elements in send buffer
+            MPI_Datatype sendtype,
+            int          dest,       // rank of destination
+            int          sendtag,
+      _Out_ void         *recvbuf,   // initial address of receive buffer
+            int          recvcount,  // number of elements in receive buffer
+            MPI_Datatype recvtype,   // type of elements in receive buffer
+            int          source,     // rank of source
+            int          recvtag,    // message tag
+            MPI_Comm     comm,
+      _Out_ MPI_Status   *status
+    );
+ */
 
-    printf("thread %d called send_recv\n", thread_data.thread_id);
+/*
+ * Description: Sync buffer using MPI_Sendrecv, i.e. Jacobian method
+ */
+void sync_buffer(ProcData &proc_data) {
+    int id = proc_data.id;
+    int upper_neighbor = (id == 0) ? MPI_PROC_NULL : id - 1;
+    int lower_neighbor = (id == SLAVE_NUM - 1) ? MPI_PROC_NULL : id + 1;
 
+    // send [PARTITION_BEGIN_INDEX, PARTITION_BEGIN_INDEX + SIDE_BUFFER_WIDTH - 1] to upper neighbor, receive upper buffer
+    MPI_Sendrecv(
+            get_buffer_begin_ptr(proc_data.WO_buffer_ptr, PARTITION_BEGIN_INDEX, 0), SIDE_BUFFER_SIZE,
+            MPI_UNSIGNED_CHAR,
+            upper_neighbor, 0,
+            get_buffer_begin_ptr(proc_data.WO_buffer_ptr, PARTITION_BEGIN_INDEX - SIDE_BUFFER_WIDTH, 0),
+            SIDE_BUFFER_SIZE, MPI_UNSIGNED_CHAR,
+            upper_neighbor, 0,
+            MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    pthread_mutex_lock(&mutex_arrived_counter);
-    arrived_threads++;
-    pthread_mutex_unlock(&mutex_arrived_counter);
+    // send [PARTITION_END_INDEX - SIDE_BUFFER_WIDTH + 1, PARTITION_END_INDEX] to lower neighbor, receive lower buffer
+    MPI_Sendrecv(
+            get_buffer_begin_ptr(proc_data.WO_buffer_ptr, PARTITION_END_INDEX - SIDE_BUFFER_WIDTH + 1, 0),
+            SIDE_BUFFER_SIZE, MPI_UNSIGNED_CHAR,
+            lower_neighbor, 0,
+            get_buffer_begin_ptr(proc_data.WO_buffer_ptr, PARTITION_END_INDEX + 1, 0), SIDE_BUFFER_SIZE,
+            MPI_UNSIGNED_CHAR,
+            lower_neighbor, 0,
+            MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    if (arrived_threads == T)
-    {
-        arrived_threads = 0;
-        pthread_cond_broadcast(&cond); // wake up all threads
-    }
-    else
-    {
-        pthread_cond_wait(&cond, &mutex); // wait for other threads
-    }
+    // swap buffer
+    swap_buffer(proc_data);
+}
 
-    // matrix read write barrier
-    static int finished_threads = 0;
-    static pthread_mutex_t mutex_finished_threads_counter = PTHREAD_MUTEX_INITIALIZER;
-    static pthread_mutex_t mutex_finished_threads = PTHREAD_MUTEX_INITIALIZER;
-    static pthread_cond_t cond_finished_threads = PTHREAD_COND_INITIALIZER;
+/*
+ * Called by Slave
+ */
+void submit_result(ProcData &proc_data) {
+    const double *buf_begin = get_buffer_begin_ptr(proc_data.RO_buffer_ptr, PARTITION_BEGIN_INDEX, 0);
+    MPI_Send(buf_begin, PARTITION_SIZE, MPI_UNSIGNED_CHAR, MASTER_ID, 0, MPI_COMM_WORLD);
+}
 
-    // send result to the global matrix variable
-    for (int i = 0; i < thread_data.partition_size; i++)
-    {
-        for (int j = 0; j < mat_dim; j++)
-        {
-            matrix[i + thread_data.partition_begin_index][j] = tmp[i + thread_data.partition_begin_index][j];
-        }
-    }
-
-    pthread_mutex_lock(&mutex_finished_threads_counter);
-    finished_threads++;
-    pthread_mutex_unlock(&mutex_finished_threads_counter);
-
-    if (finished_threads == T)
-    {
-        finished_threads = 0;
-        pthread_cond_broadcast(&cond_finished_threads); // wake up all threads
-    }
-    else
-    {
-        pthread_cond_wait(&cond_finished_threads, &mutex_finished_threads); // wait for other threads to finish writing
-    }
-
-    // recv data to the up and down, matrix is now read only
-    for (int i = 0; i < thread_data.buffer_width; i++)
-    {
-        for (int j = 0; j < mat_dim; j++)
-        {
-            if (thread_data.partition_begin_index - thread_data.buffer_width + i < 0) // uppermost partition
-            {
-                // side_buffer_up[i][j] = 0;
-                thread_data.side_buffer_up[i][j] = 0;
-            }
-            else
-            {
-                // side_buffer_up[i][j] = matrix[thread_data.partition_begin_index - thread_data.buffer_width + i][j];
-                thread_data.side_buffer_up[i][j] = matrix[thread_data.partition_begin_index - thread_data.buffer_width + i][j];
-            }
-
-            if (thread_data.partition_end_index + 1 + i >= mat_dim) // lowermost partition
-            {
-                // side_buffer_down[i][j] = 0;
-                thread_data.side_buffer_down[i][j] = 0;
-            }
-            else
-            {
-                // side_buffer_down[i][j] = matrix[thread_data.partition_end_index + 1 + i][j];
-                thread_data.side_buffer_down[i][j] = matrix[thread_data.partition_end_index + 1 + i][j];
-            }
-        }
+/*
+ * Called by Master
+ * Input: result buffer, a 2-D array in 1-D format
+ * */
+void gather_result(double *result) {
+    // receive from MPI workers
+    for (int i = 0; i < SLAVE_NUM; i++) {
+        DEBUG(TraceableInfo("Gathering result from slave %d\n", i););
+        // get MPI_Status
+        MPI_Status status;
+        MPI_Recv(get_buffer_begin_ptr(result, i * BLOCK_SIZE, 0), PARTITION_SIZE, MPI_UNSIGNED_CHAR, i, 0,
+                 MPI_COMM_WORLD, &status);
     }
 }
 
-void *thread_function(void *arg);
 
-int main(int arg, char *argv[])
-{
-    if (arg != 5)
-    {
-        printf("Usage: parallel.exe <N> <matrix dimension> <kernel dimension> <number of threads>");
+void print_buffer(const ProcData &proc_data) {
+    printf("%d========================================================\n", proc_data.id);
+    for (int i = 0; i < BLOCK_SIZE + 2 * SIDE_BUFFER_WIDTH; i++) {
+        if (i == PARTITION_BEGIN_INDEX || i == PARTITION_END_INDEX + 1) {
+            printf("%d------------------------------------\n", proc_data.id);
+        }
+
+        printf("%d-%d: ", proc_data.id, i);
+        for (int j = 0; j < MAT_DIM; j++) {
+            printf("%lf\t", proc_data.RO_buffer_ptr[i * MAT_DIM + j]);  // directly access the buffer
+        }
+        printf("\n");
+    }
+    printf("%d========================================================\n", proc_data.id);
+}
+// ****************************** ProcData Methods End  *********************************************
+
+
+
+
+// Test MPI_Sendrecv
+int main(int argc, char *argv[]) {
+
+    if (argc != 4) {
+        printf("Usage: <N> <matrix dimension> <kernel dimension>");
         exit(1);
     }
 
-    N = atoi(argv[1]);
-    mat_dim = atoi(argv[2]);
-    kernel_dim = atoi(argv[3]);
-    T = atoi(argv[4]);
+    NUM_ITER = atoi(argv[1]);
+    MAT_DIM = atoi(argv[2]);
+    KERNEL_DIM = atoi(argv[3]);
 
-    BLOCK_SIZE = mat_dim / T;
-
-    // printf("row_block_num = %d, col_block_num = %d\n", row_block_num, col_block_num);
-
-    pthread_t threads[T];
-
+    /// read inputs
+    double matrix[MAT_DIM][MAT_DIM];
+    double kernel[KERNEL_DIM][KERNEL_DIM];
     // read in the matrix from matrix.txt
     std::ifstream mat_file("matrix.txt");
-    for (int i = 0; i < mat_dim; i++)
-    {
-        for (int j = 0; j < mat_dim; j++)
-        {
+    for (int i = 0; i < MAT_DIM; i++) {
+        for (int j = 0; j < MAT_DIM; j++) {
             mat_file >> matrix[i][j];
         }
     }
     mat_file.close();
 
-    printf("matrix read in\n");
+    DEBUG(Info("matrix read in\n");)
 
     // read in the kernel from kernel.txt
     std::ifstream kernel_file("kernel.txt");
-    for (int i = 0; i < kernel_dim; i++)
-    {
-        for (int j = 0; j < kernel_dim; j++)
-        {
+    for (int i = 0; i < KERNEL_DIM; i++) {
+        for (int j = 0; j < KERNEL_DIM; j++) {
             kernel_file >> kernel[i][j];
         }
     }
     kernel_file.close();
 
-    printf("kernel read in\n");
+    DEBUG(Info("kernel read in\n");)
 
-    int thread_id[T];
-    for (int t = 0; t < T; t++)
-    {
-        thread_id[t] = t;
+    // initialize MPI
+    MPI_Init(&argc, &argv);
 
-        thread_data_array[t] = new Thread_data(t, t * BLOCK_SIZE, (t + 1) * BLOCK_SIZE - 1);
+    int my_id;
 
-        printf("thread %d, begin_row = %d, end_row = %d \n", t, thread_data_array[t]->partition_begin_index, thread_data_array[t]->partition_end_index);
-        pthread_create(&threads[t], NULL, thread_function, &thread_id[t]);
+    MPI_Comm_size(MPI_COMM_WORLD, &PROC_NUM);
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_id);
+
+    double *result = NULL;
+    if (my_id == MASTER_ID) {
+        DEBUG(Info("Master process started\n");)
+        result = new double[MAT_DIM * MAT_DIM];
+
     }
 
-    // wait for all threads to finish
-    for (int t = 0; t < T; t++)
-    {
-        pthread_join(threads[t], NULL);
-    }
+    DEBUG(Info("my_id: %d, proc_num: %d\n", my_id, PROC_NUM);)
 
-    // write result to result_parallel.txt
-    std::ofstream result_file("result_parallel.txt");
-    for (int i = 0; i < mat_dim; i++)
-    {
-        for (int j = 0; j < mat_dim; j++)
-        {
-            result_file << matrix[i][j] << "\t";
-        }
-        result_file << std::endl;
-    }
-}
+    if (my_id != MASTER_ID) {
+        DEBUG(Info("PARTITION_BEGIN_INDEX: %d, PARTITION_END_INDEX: %d\n", PARTITION_BEGIN_INDEX, PARTITION_END_INDEX);)
 
-void *thread_function(void *arg)
-{
-    int id = *(int *)arg;
+        ProcData proc_data = init_proc_data(my_id);
 
-
-    Thread_data &thread_data = *thread_data_array[id];
-
-    // initialize side buffer first
-    for (int i = 0; i < thread_data.buffer_width; i++)
-    {
-        for (int j = 0; j < mat_dim; j++)
-        {
-            if (thread_data.partition_begin_index - thread_data.buffer_width + i < 0) // uppermost partition
-            {
-                // side_buffer_up[i][j] = 0;
-                thread_data.side_buffer_up[i][j] = 0;
-            }
-            else
-            {
-                // side_buffer_up[i][j] = matrix[thread_data.partition_begin_index - thread_data.buffer_width + i][j];
-                thread_data.side_buffer_up[i][j] = matrix[thread_data.partition_begin_index - thread_data.buffer_width + i][j];
-            }
-
-            if (thread_data.partition_end_index + 1 + i >= mat_dim) // lowermost partition
-            {
-                // side_buffer_down[i][j] = 0;
-                thread_data.side_buffer_down[i][j] = 0;
-            }
-            else
-            {
-                // side_buffer_down[i][j] = matrix[thread_data.partition_end_index + 1 + i][j];
-                thread_data.side_buffer_down[i][j] = matrix[thread_data.partition_end_index + 1 + i][j];
-            }
-        }
-    }
-
-    int offset = (kernel_dim - 1) / 2;
-    for (int n = 0; n < N; n++)
-    {
-        // print margin
-        // printf("thread %d, iteration %d, get_data(0,-1) %lf\n", id, n, thread_data.get_data(0, -1));
-        // printf("thread %d, iteration %d, get_data(-1,0) %lf\n", id, n, thread_data.get_data(-1, 0));
-        // thread_data.print_buffer();
-        // convolution
-        for (int i = 0; i < thread_data.partition_size; i++)
-        {
-            for (int j = 0; j < mat_dim; j++)
-            {
-                double value = 0;
-                for (int i_ = 0; i_ < kernel_dim; i_++)
-                {
-                    for (int j_ = 0; j_ < kernel_dim; j_++)
-                    {
-                        value += kernel[i_][j_] * thread_data.get_data(i + i_ - offset, j + j_ - offset);
-                    }
+        // copy the matrix to the buffer
+        int i_offset = my_id * BLOCK_SIZE;
+        for (int i = -SIDE_BUFFER_WIDTH; i <= BLOCK_SIZE + SIDE_BUFFER_WIDTH - 1; i++) {
+            for (int j = 0; j < MAT_DIM; j++) {
+                // skip side buffer
+                if (i < 0 || i >= BLOCK_SIZE) {
+                    continue;
                 }
-                // update
-                thread_data_array[id]->set_data(i, j, value);
+                Assert(set_data(proc_data, i, j, matrix[i_offset + i][j]) == true, "set_data failed, (%d,%d)=%lf\n", i,
+                       j, matrix[i_offset + i][j]);
             }
         }
 
-        // iteration finished, send data to other threads
-        send_recv(thread_data); // barrier
+        // convolution
+        for (int n = 0; n < NUM_ITER; n++) {
+            // sync first
+            sync_buffer(proc_data);
+            // calculation
+            for (int i = 0; i < BLOCK_SIZE; i++) {
+                for (int j = 0; j < MAT_DIM; j++) {
+                    double sum = 0;
+                    for (int _i = -SIDE_BUFFER_WIDTH; _i <= SIDE_BUFFER_WIDTH; _i++) {
+                        for (int _j = -SIDE_BUFFER_WIDTH; _j <= SIDE_BUFFER_WIDTH; _j++) {
+                            sum += get_data(proc_data, i + _i, j + _j) *
+                                   kernel[_i + SIDE_BUFFER_WIDTH][_j + SIDE_BUFFER_WIDTH];
+                        }
+                    }
+                    set_data(proc_data, i, j, sum);
+                }
+            }
+        }
+
+        swap_buffer(proc_data);  // swap the buffer, so that the result is in the RO_buffer_ptr
+        // submit
+        DEBUG(Info("slave %d submitting\n", my_id);)
+        submit_result(proc_data);
+
+    } // end worker process
+
+    if (my_id == MASTER_ID) {
+        gather_result(result);
+        DEBUG(
+        // DEBUG print result
+                std::ofstream result_file("result.txt");
+                for (int i = 0; i < MAT_DIM; i++) {
+                    for (int j = 0; j < MAT_DIM; j++) {
+                        result_file << result[i * MAT_DIM + j] << "\t";
+                    }
+                    result_file << "\n";
+                }
+        )
+        DEBUG(Info("Master process ended\n");)
     }
 
-    return NULL;
+    MPI_Finalize();
+    DEBUG(Info("process %d finalized\n", my_id);)
+    return 0;
 }
