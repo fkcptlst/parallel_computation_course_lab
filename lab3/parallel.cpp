@@ -1,8 +1,9 @@
-#include "mpi.h"
 #include <stdlib.h>
 #include <string.h>
+#include <iostream>
 #include <fstream>
 #include <unistd.h>
+#include "mpi.h"
 
 //#define DEBUG_ON
 
@@ -208,8 +209,7 @@ void submit_result(ProcData &proc_data) {
 void gather_result(double *result) {
     // receive from MPI workers
     for (int i = 0; i < SLAVE_NUM; i++) {
-        DEBUG(TraceableInfo("Gathering result from slave %d\n", i););
-        // get MPI_Status
+         // get MPI_Status
         MPI_Status status;
         MPI_Recv(get_buffer_begin_ptr(result, i * BLOCK_SIZE, 0), PARTITION_SIZE, MPI_UNSIGNED_CHAR, i, 0,
                  MPI_COMM_WORLD, &status);
@@ -343,8 +343,10 @@ int main(int argc, char *argv[]) {
                 for (int i = 0; i < MAT_DIM; i++) {
                     for (int j = 0; j < MAT_DIM; j++) {
                         result_file << result[i * MAT_DIM + j] << "\t";
+                        std::cout << result[i * MAT_DIM + j] << "\t";
                     }
                     result_file << "\n";
+                    std::cout << "\n";
                 }
         )
         DEBUG(Info("Master process ended\n");)

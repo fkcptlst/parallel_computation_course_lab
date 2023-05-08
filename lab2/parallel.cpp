@@ -22,6 +22,39 @@ int matrix[MAX_MAT_DIM][MAX_MAT_DIM];
 int kernel[MAX_KERNEL_DIM][MAX_KERNEL_DIM];
 int tmp[MAX_MAT_DIM][MAX_MAT_DIM]; // middle result
 
+typedef struct Bstate
+{
+    pthread_mutex_t barrier_mutex;
+    pthread_cond_t barrier_cond;
+    int nthread; // Number of threads that have reached this round of the barrier
+    Bstate()
+    {
+        assert(pthread_mutex_init(&barrier_mutex, NULL) == 0);
+        assert(pthread_cond_init(&barrier_cond, NULL) == 0);
+        nthread = 0;
+    }
+} Bstate;
+
+Bstate stage_1, stage_2;
+
+void barrier(Bstate &bstate)
+{
+    pthread_mutex_lock(&bstate.barrier_mutex);
+
+    bstate.nthread++;
+
+    if (bstate.nthread == T) // all reached barrier
+    {
+        bstate.nthread = 0;
+        pthread_cond_broadcast(&bstate.barrier_cond);
+    }
+    else
+    {
+        pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
+    }
+    pthread_mutex_unlock(&bstate.barrier_mutex);
+}
+
 typedef struct Thread_data
 {
     int thread_id;
@@ -48,29 +81,6 @@ typedef struct Thread_data
             side_buffer_down[i].resize(mat_dim);
         }
     }
-
-    // double get_data(int i, int j) // i and j are local indices, i.e. j in [0, partition_size - 1]
-    // {
-    //     if (j < 0 || j >= mat_dim) // padding
-    //     {
-    //         return 0;
-    //     }
-    //     else if (i < 0 || i >= partition_size) // use jacobian buffer
-    //     {
-    //         if (i < 0) // upper buffer
-    //         {
-    //             return side_buffer_up[buffer_width + i][j];
-    //         }
-    //         else // lower buffer
-    //         {
-    //             return side_buffer_down[i - partition_size][j];
-    //         }
-    //     }
-    //     else // within the block partition
-    //     {
-    //         return matrix[i + partition_begin_index][j];
-    //     }
-    // }
 
     void print_buffer()
     {
@@ -139,32 +149,12 @@ void send_recv(Thread_data &thread_data)
     // barrier
     static bool initialized = false;
     static int arrived_threads = 0;
-    static pthread_mutex_t mutex_arrived_counter = PTHREAD_MUTEX_INITIALIZER;
-    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-    static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
-    printf("thread %d called send_recv\n", thread_data.thread_id);
+    // printf("thread %d called send_recv\n", thread_data.thread_id);
 
+    barrier(stage_1);
 
-    pthread_mutex_lock(&mutex_arrived_counter);
-    arrived_threads++;
-    pthread_mutex_unlock(&mutex_arrived_counter);
-
-    if (arrived_threads == T)
-    {
-        arrived_threads = 0;
-        pthread_cond_broadcast(&cond); // wake up all threads
-    }
-    else
-    {
-        pthread_cond_wait(&cond, &mutex); // wait for other threads
-    }
-
-    // matrix read write barrier
-    static int finished_threads = 0;
-    static pthread_mutex_t mutex_finished_threads_counter = PTHREAD_MUTEX_INITIALIZER;
-    static pthread_mutex_t mutex_finished_threads = PTHREAD_MUTEX_INITIALIZER;
-    static pthread_cond_t cond_finished_threads = PTHREAD_COND_INITIALIZER;
+    // printf("thread %d awake 1\n", thread_data.thread_id);
 
     // send result to the global matrix variable
     for (int i = 0; i < thread_data.partition_size; i++)
@@ -174,20 +164,12 @@ void send_recv(Thread_data &thread_data)
             matrix[i + thread_data.partition_begin_index][j] = tmp[i + thread_data.partition_begin_index][j];
         }
     }
+    
+    // printf("thread %d send complete\n", thread_data.thread_id);
 
-    pthread_mutex_lock(&mutex_finished_threads_counter);
-    finished_threads++;
-    pthread_mutex_unlock(&mutex_finished_threads_counter);
+    barrier(stage_2);
 
-    if (finished_threads == T)
-    {
-        finished_threads = 0;
-        pthread_cond_broadcast(&cond_finished_threads); // wake up all threads
-    }
-    else
-    {
-        pthread_cond_wait(&cond_finished_threads, &mutex_finished_threads); // wait for other threads to finish writing
-    }
+    // printf("thread %d awake 2\n", thread_data.thread_id);
 
     // recv data to the up and down, matrix is now read only
     for (int i = 0; i < thread_data.buffer_width; i++)
@@ -251,7 +233,7 @@ int main(int arg, char *argv[])
     }
     mat_file.close();
 
-    printf("matrix read in\n");
+    // printf("matrix read in\n");
 
     // read in the kernel from kernel.txt
     std::ifstream kernel_file("kernel.txt");
@@ -264,7 +246,7 @@ int main(int arg, char *argv[])
     }
     kernel_file.close();
 
-    printf("kernel read in\n");
+    // printf("kernel read in\n");
 
     int thread_id[T];
     for (int t = 0; t < T; t++)
@@ -273,7 +255,7 @@ int main(int arg, char *argv[])
 
         thread_data_array[t] = new Thread_data(t, t * BLOCK_SIZE, (t + 1) * BLOCK_SIZE - 1);
 
-        printf("thread %d, begin_row = %d, end_row = %d \n", t, thread_data_array[t]->partition_begin_index, thread_data_array[t]->partition_end_index);
+        // printf("thread %d, begin_row = %d, end_row = %d \n", t, thread_data_array[t]->partition_begin_index, thread_data_array[t]->partition_end_index);
         pthread_create(&threads[t], NULL, thread_function, &thread_id[t]);
     }
 
@@ -283,16 +265,18 @@ int main(int arg, char *argv[])
         pthread_join(threads[t], NULL);
     }
 
-    // write result to result_parallel.txt
-    std::ofstream result_file("result_parallel.txt");
-    for (int i = 0; i < mat_dim; i++)
-    {
-        for (int j = 0; j < mat_dim; j++)
-        {
-            result_file << matrix[i][j] << "\t";
-        }
-        result_file << std::endl;
-    }
+    // printf("done!\n");
+
+//     // write result to result_parallel.txt
+//     std::ofstream result_file("result_parallel.txt");
+//     for (int i = 0; i < mat_dim; i++)
+//     {
+//         for (int j = 0; j < mat_dim; j++)
+//         {
+//             result_file << matrix[i][j] << "\t";
+//         }
+//         result_file << std::endl;
+//     }
 }
 
 void *thread_function(void *arg)
@@ -334,6 +318,7 @@ void *thread_function(void *arg)
     int offset = (kernel_dim - 1) / 2;
     for (int n = 0; n < N; n++)
     {
+        // printf("round %d ========================================\n", n);
         // print margin
         // printf("thread %d, iteration %d, get_data(0,-1) %lf\n", id, n, thread_data.get_data(0, -1));
         // printf("thread %d, iteration %d, get_data(-1,0) %lf\n", id, n, thread_data.get_data(-1, 0));

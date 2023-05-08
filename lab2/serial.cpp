@@ -87,14 +87,14 @@ int main(int arg, char *argv[])
         }
     }
 
-    // write result to result.txt
-    std::ofstream result_file("result_serial.txt");
-    for (int i = 0; i < mat_dim; i++)
-    {
-        for (int j = 0; j < mat_dim; j++)
-        {
-            result_file << result[i][j] << "\t";
-        }
-        result_file << std::endl;
-    }
+//    // write result to result.txt
+//    std::ofstream result_file("result_serial.txt");
+//    for (int i = 0; i < mat_dim; i++)
+//    {
+//        for (int j = 0; j < mat_dim; j++)
+//        {
+//            result_file << result[i][j] << "\t";
+//        }
+//        result_file << std::endl;
+//    }
 }

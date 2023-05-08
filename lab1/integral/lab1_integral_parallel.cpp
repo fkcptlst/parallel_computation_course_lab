@@ -39,12 +39,13 @@ int main(int arg, char* argv[]) {
     
     proc_end_time = clock();
 
-    printf("proc time=%lf\n",double(proc_end_time - proc_start_time) / (double)CLOCKS_PER_SEC);
-    for(int i=0; i < T; i++)
-    {
-        printf("thread %d time=%lf\n", i, double(end_time[i] - start_time[i]) / (double)CLOCKS_PER_SEC);
-    }
+    // printf("proc time=%lf\n",double(proc_end_time - proc_start_time) / (double)CLOCKS_PER_SEC);
+    // for(int i=0; i < T; i++)
+    // {
+    //     printf("thread %d time=%lf\n", i, double(end_time[i] - start_time[i]) / (double)CLOCKS_PER_SEC);
+    // }
 
+    // printf("result=%lf\n", PI);
     return 0;
 }
 

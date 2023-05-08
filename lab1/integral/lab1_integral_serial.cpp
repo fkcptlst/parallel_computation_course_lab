@@ -14,7 +14,7 @@ int main(int arg, char* argv[]) {
         PI += (4.0 / (1.0 + ((i + 0.5) / N) * ((i + 0.5) / N))) / N;
     }
     proc_end_time = clock();
-    printf("proc time=%lf\n",double(proc_end_time - proc_start_time) / (double)CLOCKS_PER_SEC);
+    // printf("proc time=%lf\n",double(proc_end_time - proc_start_time) / (double)CLOCKS_PER_SEC);
     // printf("result=%lf\n", PI);
     return 0;
 }

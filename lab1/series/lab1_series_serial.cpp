@@ -15,6 +15,6 @@ int main(int arg, char* argv[])
         PI += double(coe)/double(2*i + 1);
     }
     PI *= 4;
-    printf("result=%lf\n", PI);
+    // printf("result=%lf\n", PI);
     return 0;
 }

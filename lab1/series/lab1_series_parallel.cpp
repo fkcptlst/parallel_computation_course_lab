@@ -25,9 +25,8 @@ int main(int arg, char* argv[]) {
     // wait
     for (int i = 0;i < T;i++) {
         pthread_join(thread[i], NULL);
-        printf("Thread %d done!\n", i);
     }
-    printf("result=%lf\n", PI);
+    // printf("result=%lf\n", PI);
     return 0;
 }
 

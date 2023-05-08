@@ -26,10 +26,10 @@ int main(int argc,char *argv[])
     }
     for (int i = 0;i < T; i++) {
         pthread_join(thread[i], NULL);
-        printf("Thread %d done!\n", i);
+        // printf("Thread %d done!\n", i);
     }
     PI = 4 * M / N;
-    printf("result=%lf\n", PI);
+    // printf("result=%lf\n", PI);
     return 0;
 }
 

@@ -22,6 +22,6 @@ int main(int argc,char *argv[])
         }
     }
     PI = 4 * m / N;
-    printf("result=%lf\n", PI);
+    // printf("result=%lf\n", PI);
     return 0;
 }
