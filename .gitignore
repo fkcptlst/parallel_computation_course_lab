@@ -11,4 +11,5 @@
 */.idea
 *.csv
 */*.csv
+*/*.txt
 .vscode
